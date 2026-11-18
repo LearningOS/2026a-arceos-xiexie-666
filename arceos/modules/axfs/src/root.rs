@@ -133,12 +133,64 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
+        // The RAM filesystem mounted at "/tmp" does not implement
+        // `VfsNodeOps::rename`, so the rename is emulated on top of the generic
+        // VFS primitives: create the destination node, copy the file content
+        // over and then remove the source node. Only renames that stay inside
+        // one mount point are supported, which is enough for a plain rename.
+        self.lookup_mounted_fs(src_path, |src_fs, src_rest| {
+            if src_rest.is_empty() {
+                return ax_err!(PermissionDenied); // cannot rename mount points
             }
+            self.lookup_mounted_fs(dst_path, |dst_fs, dst_rest| {
+                if dst_rest.is_empty() {
+                    return ax_err!(PermissionDenied);
+                }
+                if !Arc::ptr_eq(&src_fs, &dst_fs) {
+                    return ax_err!(Unsupported, "cannot rename across mount points");
+                }
+                let root_dir = src_fs.root_dir();
+                let src_node = root_dir.clone().lookup(src_rest)?;
+                if root_dir.clone().lookup(dst_rest).is_ok() {
+                    return ax_err!(AlreadyExists);
+                }
+                let attr = src_node.get_attr()?;
+                if !attr.is_file() {
+                    return ax_err!(Unsupported, "only a file can be renamed");
+                }
+
+                let result = (|| {
+                    root_dir.create(dst_rest, VfsNodeType::File)?;
+                    let dst_node = root_dir.clone().lookup(dst_rest)?;
+
+                    let mut buf: Vec<u8> = Vec::new();
+                    buf.resize(attr.size() as usize, 0);
+                    let mut read = 0;
+                    while read < buf.len() {
+                        let n = src_node.read_at(read as u64, &mut buf[read..])?;
+                        if n == 0 {
+                            break;
+                        }
+                        read += n;
+                    }
+                    let mut written = 0;
+                    while written < read {
+                        let n = dst_node.write_at(written as u64, &buf[written..read])?;
+                        if n == 0 {
+                            return ax_err!(Io, "failed to write the renamed file");
+                        }
+                        written += n;
+                    }
+                    Ok(())
+                })();
+
+                if result.is_err() {
+                    root_dir.remove(dst_rest).ok(); // roll back the destination
+                }
+                result?;
+                root_dir.remove(src_rest)?;
+                Ok(())
+            })
         })
     }
 }

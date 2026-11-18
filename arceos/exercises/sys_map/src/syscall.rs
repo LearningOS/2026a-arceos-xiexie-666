@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_void, c_char, c_int};
+use alloc::vec;
 use axhal::arch::TrapFrame;
+use axhal::mem::{VirtAddr, PAGE_SIZE_4K};
+use memory_addr::{MemoryAddr, VirtAddrRange};
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
 use axtask::current;
@@ -131,16 +134,69 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
+/// Maps `length` bytes of the file `fd` into the address space of the current
+/// task.
+///
+/// This is a simplified `mmap(2)`: the whole range is mapped eagerly as an
+/// anonymous private mapping, and the file contents are copied in right away
+/// (there is no demand paging or page cache behind it). `addr` is only honoured
+/// when `MAP_FIXED` is given, otherwise a free hole in the address space is
+/// picked by the allocator.
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let prot = MmapProt::from_bits_truncate(prot);
+    let flags = MmapFlags::from_bits_truncate(flags);
+
+    if length == 0 || offset < 0 || (offset as usize) % PAGE_SIZE_4K != 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+
+    let length = (length + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+
+    let curr = current();
+    let mut aspace = curr.task_ext().aspace.lock();
+
+    let hint = VirtAddr::from_usize(addr as usize);
+    let uva = if flags.contains(MmapFlags::MAP_FIXED) {
+        hint.align_down_4k()
+    } else {
+        let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+        match aspace.find_free_area(hint, length, limit) {
+            Some(vaddr) => vaddr,
+            None => return -LinuxError::ENOMEM.code() as isize,
+        }
+    };
+
+    if aspace
+        .map_alloc(uva, length, MappingFlags::from(prot), true)
+        .is_err()
+    {
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+
+    // Fill the mapping with the file contents (a private file-backed mapping in
+    // this simplified kernel simply reads the file at map time).
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) && fd >= 0 {
+        let mut buf = vec![0u8; length];
+        let n = api::sys_read(fd, buf.as_mut_ptr() as *mut c_void, length);
+        if n < 0 {
+            let _ = aspace.unmap(uva, length);
+            return n as isize;
+        }
+        let n = n as usize;
+        if n > 0 && aspace.write(uva, &buf[..n]).is_err() {
+            let _ = aspace.unmap(uva, length);
+            return -LinuxError::EIO.code() as isize;
+        }
+    }
+
+    uva.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

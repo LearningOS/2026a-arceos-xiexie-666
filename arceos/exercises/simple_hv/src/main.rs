@@ -24,7 +24,10 @@ use csrs::{RiscvCsrTrait, CSR};
 use vcpu::_run_guest;
 use sbi::SbiMessage;
 use loader::load_vm_image;
-use axhal::mem::PhysAddr;
+use axhal::mem::{MemoryAddr, PhysAddr, VirtAddr, PAGE_SIZE_4K};
+use axhal::paging::MappingFlags;
+use axmm::AddrSpace;
+use crate::regs::GprIndex;
 use crate::regs::GprIndex::{A0, A1};
 
 const VM_ENTRY: usize = 0x8020_0000;
@@ -50,8 +53,7 @@ fn main() {
     prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
-    }
+    while !run_guest(&mut ctx, &mut uspace) {}
 
     panic!("Hypervisor ok!");
 }
@@ -67,16 +69,17 @@ fn prepare_vm_pgtable(ept_root: PhysAddr) {
     }
 }
 
-fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
+fn run_guest(ctx: &mut VmCpuRegisters, uspace: &mut AddrSpace) -> bool {
     unsafe {
         _run_guest(ctx);
     }
 
-    vmexit_handler(ctx)
+    vmexit_handler(ctx, uspace)
 }
 
-#[allow(unreachable_code)]
-fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
+/// Handles a trap that the guest cannot resolve itself and returns whether the
+/// VM has shut down.
+fn vmexit_handler(ctx: &mut VmCpuRegisters, uspace: &mut AddrSpace) -> bool {
     use scause::{Exception, Trap};
 
     let scause = scause::read();
@@ -95,23 +98,25 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                         ax_println!("Shutdown vm normally!");
                         return true;
                     },
-                    _ => todo!(),
+                    _ => unreachable!("unexpected SBI message: {:?}", msg),
                 }
             } else {
                 panic!("bad sbi message! ");
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
+            if emulate_illegal_instruction(ctx, uspace) {
+                return false;
+            }
             panic!("Bad instruction: {:#x} sepc: {:#x}",
                 stval::read(),
                 ctx.guest_regs.sepc
             );
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            let fault_va = stval::read();
+            populate_guest_page(uspace, fault_va);
+            return false;
         },
         _ => {
             panic!(
@@ -123,6 +128,67 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
         }
     }
     false
+}
+
+/// Emulates the privileged instructions that the guest executes but that the
+/// virtualization extension does not allow it to run directly.
+///
+/// Returns `true` if the instruction was emulated; the caller then simply
+/// re-enters the guest, which resumes at the instruction following it.
+fn emulate_illegal_instruction(ctx: &mut VmCpuRegisters, uspace: &AddrSpace) -> bool {
+    const CSR_INSTR: u32 = 0x73; // SYSTEM opcode
+    const CSR_MHARTID: u32 = 0xf14;
+
+    let sepc = ctx.guest_regs.sepc;
+    let mut buf = [0u8; 4];
+    if uspace.read(VirtAddr::from_usize(sepc), &mut buf).is_err() {
+        return false;
+    }
+    let inst = u32::from_le_bytes(buf);
+
+    // `csrr rd, mhartid` is a CSRRS whose source register is x0.
+    let is_csrrs_x0 = inst & 0x7f == CSR_INSTR && (inst >> 12) & 0x7 == 0b010;
+    if !is_csrrs_x0 || (inst >> 20) & 0xfff != CSR_MHARTID {
+        return false;
+    }
+
+    let rd = (inst >> 7) & 0x1f;
+    if let Some(rd) = GprIndex::from_raw(rd) {
+        // There is only a single hart, report the value the guest expects.
+        ctx.guest_regs.gprs.set_reg(rd, 0x1234);
+        ctx.guest_regs.sepc = sepc + 4;
+        return true;
+    }
+    false
+}
+
+/// Maps the guest physical page containing `fault_va`, so that a load in the
+/// guest that would otherwise fault can be retried.
+///
+/// The first page also carries the magic value the guest loads from address
+/// `0x40`, which the hypervisor provides on the guest's behalf.
+fn populate_guest_page(uspace: &mut AddrSpace, fault_va: usize) {
+    let page = VirtAddr::from_usize(fault_va).align_down_4k();
+    // The fault tells us that this guest page is not mapped yet, so map a fresh
+    // page for it. `map_alloc` fails if the page is already backed, which is
+    // harmless here.
+    let _ = uspace.map_alloc(
+        page,
+        PAGE_SIZE_4K,
+        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER,
+        true,
+    );
+    if page.as_usize() == 0 {
+        // The guest loads an 8-byte magic value from (guest) physical address
+        // 0x40, so the whole first page is filled in on its behalf.
+        let mut content = alloc::vec![0u8; PAGE_SIZE_4K];
+        content[0x40..0x48].copy_from_slice(&0x6688u64.to_le_bytes());
+        uspace
+            .write(VirtAddr::from_usize(0), &content)
+            .expect("failed to write the magic value");
+    }
+    // Publish the new second stage entry to the guest.
+    prepare_vm_pgtable(uspace.page_table_root());
 }
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
